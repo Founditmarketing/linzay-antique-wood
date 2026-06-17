@@ -1,5 +1,20 @@
 const RESEND_URL = "https://api.resend.com/emails";
 
+// Per-IP rate limit (in-memory; persists across warm invocations, resets on cold start).
+const RATE_WINDOW_MS = 10 * 60 * 1000; // 10 min
+const RATE_MAX       = 3;              // max submissions per window
+const __ipHits = new Map();
+
+function rateLimited(ip) {
+  if (!ip) return false;
+  const now = Date.now();
+  const hits = (__ipHits.get(ip) || []).filter((t) => now - t < RATE_WINDOW_MS);
+  if (hits.length >= RATE_MAX) return true;
+  hits.push(now);
+  __ipHits.set(ip, hits);
+  return false;
+}
+
 function escapeHtml(s) {
   return String(s ?? "")
     .replace(/&/g, "&amp;")
@@ -47,15 +62,35 @@ module.exports = async (req, res) => {
   const apiKey = process.env.RESEND_API_KEY;
   if (!apiKey) { res.statusCode = 500; return res.end("Server misconfigured: RESEND_API_KEY missing"); }
 
-  let body;
-  try { body = await parseBody(req); }
-  catch { res.statusCode = 400; return res.end("Bad request"); }
-
-  if (body._website && String(body._website).trim()) {
+  const ip = (req.headers["x-forwarded-for"] || "").split(",")[0].trim() || req.socket?.remoteAddress || "";
+  if (rateLimited(ip)) {
     res.statusCode = 303;
     res.setHeader("Location", "/thank-you");
     return res.end();
   }
+
+  let body;
+  try { body = await parseBody(req); }
+  catch { res.statusCode = 400; return res.end("Bad request"); }
+
+  // --- spam filters (silent drop — pretend success so bots don't retry) ---
+  // Honeypots: any of these filled = bot
+  const traps = ["_website", "_url", "_phone_secondary", "_company"];
+  for (const t of traps) {
+    if (body[t] && String(body[t]).trim()) {
+      res.statusCode = 303;
+      res.setHeader("Location", "/thank-you");
+      return res.end();
+    }
+  }
+  // Time-based: form must have been on the page at least 2s
+  const formLoadedAt = Number(body._t || 0);
+  if (formLoadedAt > 0 && Date.now() - formLoadedAt < 2000) {
+    res.statusCode = 303;
+    res.setHeader("Location", "/thank-you");
+    return res.end();
+  }
+  // ---
 
   const name        = pickField(body, "name");
   const email       = pickField(body, "email");
